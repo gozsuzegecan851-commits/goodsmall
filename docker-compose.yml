@@ -1,0 +1,140 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: goodsmall-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - goodsmall_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: goodsmall-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      BACKEND_PORT: ${BACKEND_PORT:-8002}
+      BACKEND_PUBLIC_URL: ${BACKEND_PUBLIC_URL}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET}
+      ADMIN_SESSION_DAYS: ${ADMIN_SESSION_DAYS:-7}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      USDT_TRON_API_BASE: ${USDT_TRON_API_BASE}
+      TRONGRID_API_KEY: ${TRONGRID_API_KEY}
+      USDT_TRC20_CONTRACT: ${USDT_TRC20_CONTRACT}
+      USDT_POLL_SECONDS: ${USDT_POLL_SECONDS:-20}
+      PAYMENT_EXPIRE_MINUTES: ${PAYMENT_EXPIRE_MINUTES:-30}
+      PAYMENT_AMOUNT_OFFSET_ENABLED: ${PAYMENT_AMOUNT_OFFSET_ENABLED:-true}
+      PAYMENT_AMOUNT_OFFSET_STEP: ${PAYMENT_AMOUNT_OFFSET_STEP:-0.001}
+      PAYMENT_AMOUNT_OFFSET_SLOTS: ${PAYMENT_AMOUNT_OFFSET_SLOTS:-20}
+      LOGISTICS_PROVIDER: ${LOGISTICS_PROVIDER}
+      KUAIDI100_KEY: ${KUAIDI100_KEY}
+      KUAIDI100_CUSTOMER: ${KUAIDI100_CUSTOMER}
+      BOT_ENABLED_SYNC_SECONDS: ${BOT_ENABLED_SYNC_SECONDS:-5}
+      BOT_RUNTIME_HEARTBEAT_SECONDS: ${BOT_RUNTIME_HEARTBEAT_SECONDS:-15}
+      SESSION_PUSH_SECONDS: ${SESSION_PUSH_SECONDS:-5}
+      LOGISTICS_SYNC_SECONDS: ${LOGISTICS_SYNC_SECONDS:-1800}
+      BOT_PROFILE_AUTO_SYNC_ENABLED: ${BOT_PROFILE_AUTO_SYNC_ENABLED:-false}
+      BOT_PROFILE_AUTO_SYNC_SECONDS: ${BOT_PROFILE_AUTO_SYNC_SECONDS:-3600}
+      BOT_PROFILE_AUTO_SYNC_SCOPE: ${BOT_PROFILE_AUTO_SYNC_SCOPE:-enabled}
+      BOT_PROFILE_AUTO_SYNC_BOT_TYPE: ${BOT_PROFILE_AUTO_SYNC_BOT_TYPE:-all}
+      TZ: ${TZ:-Asia/Shanghai}
+      RES_OPTIONS: "attempts:2 timeout:2 rotate single-request-reopen"
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8002}:8000"
+    volumes:
+      - ./backend/app/static/uploads:/app/app/static/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 223.5.5.5
+
+  bot_buyer:
+    build:
+      context: ./bot_buyer
+    container_name: goodsmall-bot-buyer
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_BASE: http://backend:8000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      BOT_TOKEN: ${BUYER_BOT_TOKEN}
+      RUNNER_TYPE: buyer
+      BOT_ENABLED_SYNC_SECONDS: ${BOT_ENABLED_SYNC_SECONDS:-5}
+      BOT_RUNTIME_HEARTBEAT_SECONDS: ${BOT_RUNTIME_HEARTBEAT_SECONDS:-15}
+      TZ: ${TZ:-Asia/Shanghai}
+      RES_OPTIONS: "attempts:2 timeout:2 rotate single-request-reopen"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 223.5.5.5
+
+  bot_session:
+    build:
+      context: ./bot_session
+    container_name: goodsmall-bot-session
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_BASE: http://backend:8000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      BOT_TOKEN: ${SESSION_BOT_TOKEN}
+      RUNNER_TYPE: session
+      BOT_ENABLED_SYNC_SECONDS: ${BOT_ENABLED_SYNC_SECONDS:-5}
+      BOT_RUNTIME_HEARTBEAT_SECONDS: ${BOT_RUNTIME_HEARTBEAT_SECONDS:-15}
+      SESSION_PUSH_SECONDS: ${SESSION_PUSH_SECONDS:-5}
+      TZ: ${TZ:-Asia/Shanghai}
+      RES_OPTIONS: "attempts:2 timeout:2 rotate single-request-reopen"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 223.5.5.5
+
+  bot_shipping:
+    build:
+      context: ./bot_shipping
+    container_name: goodsmall-bot-shipping
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_BASE: http://backend:8000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      BOT_TOKEN: ${SHIPPING_BOT_TOKEN}
+      RUNNER_TYPE: shipping
+      BOT_ENABLED_SYNC_SECONDS: ${BOT_ENABLED_SYNC_SECONDS:-5}
+      BOT_RUNTIME_HEARTBEAT_SECONDS: ${BOT_RUNTIME_HEARTBEAT_SECONDS:-15}
+      LOGISTICS_SYNC_SECONDS: ${LOGISTICS_SYNC_SECONDS:-1800}
+      TZ: ${TZ:-Asia/Shanghai}
+      RES_OPTIONS: "attempts:2 timeout:2 rotate single-request-reopen"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+      - 223.5.5.5
+
+volumes:
+  goodsmall_postgres_data:
