@@ -31,6 +31,11 @@ def _normalize_amount(value: Decimal | str | int | float) -> Decimal:
     return amount.quantize(Decimal('0.000001'), rounding=ROUND_DOWN)
 
 
+def _format_amount_6(value: Decimal | str | int | float) -> str:
+    """Return fixed 6-decimal string for API display/output."""
+    return f"{_normalize_amount(value):.6f}"
+
+
 def _offset_candidates(base_amount: Decimal) -> list[tuple[Decimal, Decimal]]:
     if not settings.payment_amount_offset_enabled:
         return [(base_amount, Decimal('0'))]
@@ -82,7 +87,7 @@ def serialize_payment(payment: PaymentOrder, address: PaymentAddress | None = No
         "order_id": payment.order_id,
         "pay_method": payment.pay_method,
         "receive_address": payment.receive_address,
-        "expected_amount": str(payment.expected_amount),
+        "expected_amount": _format_amount_6(payment.expected_amount),
         "base_amount": str(getattr(payment, 'base_amount', payment.expected_amount)),
         "amount_offset": str(getattr(payment, 'amount_offset', Decimal('0'))),
         "paid_amount": str(payment.paid_amount),
