@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..models import Order, PaymentOrder
 from .order_service import mark_order_paid_state
+from .payment_confirm_rule_service import match_tx_for_payment, validate_confirm_runtime
 
 
 def _env(name: str, default: str = "") -> str:
@@ -58,8 +59,9 @@ def refresh_payment_order_status(db: Session, order: Order, payment: PaymentOrde
 
     base_url = _env("TRONGRID_BASE_URL", "https://api.trongrid.io").rstrip("/")
     contract = _env("USDT_TRC20_CONTRACT")
-    if not contract:
-        raise RuntimeError("未配置 USDT_TRC20_CONTRACT")
+    ok, reason = validate_confirm_runtime(api_key, contract)
+    if not ok:
+        raise RuntimeError(reason)
 
     lookback_minutes = int(_env("TRON_PAY_LOOKBACK_MINUTES", "30") or "30")
     receive_address = str(payment.receive_address or "").strip()
@@ -97,20 +99,37 @@ def refresh_payment_order_status(db: Session, order: Order, payment: PaymentOrde
     payload = resp.json()
     rows = payload.get("data") or []
     matched = None
+    matched_amount = Decimal("0")
+    matched_txid = ""
+    last_reason = "链上暂未查到匹配金额的已确认 TRC20 入账"
 
     for item in rows:
         token_info = item.get("token_info") or {}
         amount = _to_decimal(item.get("value"), token_info.get("decimals"))
+        ok, txid, reason = match_tx_for_payment(
+            item,
+            receive_address=receive_address,
+            expected_amount=expected_amount,
+            paid_amount=amount,
+            expected_contract=contract,
+        )
         item["_normalized_amount"] = str(amount)
-
-        to_addr = str(item.get("to") or item.get("to_address") or item.get("toAddress") or "").strip()
-        if to_addr and receive_address and to_addr.lower() != receive_address.lower():
+        if not ok:
+            last_reason = reason or _short_reason(item)
             continue
 
-        if abs(amount - expected_amount) > Decimal("0.000001"):
+        tx_used = (
+            db.query(PaymentOrder)
+            .filter(PaymentOrder.txid == txid, PaymentOrder.id != payment.id)
+            .first()
+        )
+        if tx_used:
+            last_reason = f"txid 已被其他支付单占用: {txid[:12]}"
             continue
 
         matched = item
+        matched_amount = amount
+        matched_txid = txid
         break
 
     if not matched:
@@ -120,12 +139,11 @@ def refresh_payment_order_status(db: Session, order: Order, payment: PaymentOrde
         return {
             "matched": False,
             "status": str(payment.confirm_status or "pending"),
-            "reason": "链上暂未查到匹配金额的已确认 TRC20 入账",
+            "reason": last_reason,
         }
 
-    paid_amount = _to_decimal(matched.get("value"), (matched.get("token_info") or {}).get("decimals"))
-    payment.paid_amount = paid_amount
-    payment.txid = str(matched.get("transaction_id") or matched.get("txid") or "").strip()
+    payment.paid_amount = matched_amount
+    payment.txid = matched_txid
     payment.from_address = str(matched.get("from") or matched.get("from_address") or matched.get("fromAddress") or "").strip()
     payment.to_address = str(matched.get("to") or matched.get("to_address") or matched.get("toAddress") or receive_address).strip()
     payment.confirm_status = "confirmed"

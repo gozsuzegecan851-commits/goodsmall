@@ -10,14 +10,11 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..models import Order, PaymentOrder
 from ..services.order_service import mark_order_expired_state, mark_order_paid_state
+from ..services.payment_confirm_rule_service import match_tx_for_payment, validate_confirm_runtime
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _is_real_api_key(value: str) -> bool:
-    return bool(value) and not str(value).startswith("replace_with_")
 
 
 def _normalize_decimal(value: Decimal | str | int | float) -> Decimal:
@@ -57,21 +54,9 @@ def _parse_amount(tx: dict) -> Decimal:
     return _normalize_decimal(raw_dec)
 
 
-def _match_contract(tx: dict) -> bool:
-    expected = (settings.usdt_trc20_contract or "").strip().lower()
-    if not expected:
-        return True
-    token_info = tx.get("token_info") or {}
-    got = str(token_info.get("address") or "").strip().lower()
-    if not got:
-        return True
-    return got == expected
-
-
 def _fetch_address_trc20(address: str, min_timestamp_ms: int) -> list[dict]:
     headers = {}
-    if _is_real_api_key(settings.trongrid_api_key):
-        headers["TRON-PRO-API-KEY"] = settings.trongrid_api_key
+    headers["TRON-PRO-API-KEY"] = settings.trongrid_api_key
     params = {
         "only_to": "true",
         "only_confirmed": "true",
@@ -120,9 +105,9 @@ def poll_usdt_once(db: Session) -> dict:
         "message": "",
     }
 
-    if not _is_real_api_key(settings.trongrid_api_key):
-        result["skipped"] = True
-        result["message"] = "TRONGRID_API_KEY 未配置，自动确认跳过"
+    ok, reason = validate_confirm_runtime(settings.trongrid_api_key, settings.usdt_trc20_contract)
+    if not ok:
+        result["message"] = reason
         return result
 
     pending_rows = (
@@ -155,12 +140,15 @@ def poll_usdt_once(db: Session) -> dict:
 
         expected_amount = _normalize_decimal(payment.expected_amount)
         for tx in txs:
-            if not _match_contract(tx):
-                continue
-            if str(tx.get("to") or "").strip() != str(payment.receive_address).strip():
-                continue
-            txid = str(tx.get("transaction_id") or tx.get("id") or "").strip()
-            if not txid:
+            paid_amount = _parse_amount(tx)
+            matched, txid, _reason = match_tx_for_payment(
+                tx,
+                receive_address=payment.receive_address,
+                expected_amount=expected_amount,
+                paid_amount=paid_amount,
+                expected_contract=settings.usdt_trc20_contract,
+            )
+            if not matched:
                 continue
             tx_used = (
                 db.query(PaymentOrder)
@@ -168,9 +156,6 @@ def poll_usdt_once(db: Session) -> dict:
                 .first()
             )
             if tx_used:
-                continue
-            paid_amount = _parse_amount(tx)
-            if paid_amount != expected_amount:
                 continue
             _confirm_payment(db, payment, order, tx, paid_amount)
             result["confirmed"] += 1
