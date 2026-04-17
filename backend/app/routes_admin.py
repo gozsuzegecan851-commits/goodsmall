@@ -45,6 +45,11 @@ from .services.product_import_service import (
     delete_product_import_batch,
     retry_product_import_batch,
 )
+from .services.payment_finalize_service import (
+    get_order_and_latest_payment_for_update,
+    simulate_payment_finalize_enabled,
+    simulate_payment_success,
+)
 from .services.shipment_export_service import build_shipments_workbook
 from .config import settings
 from .announcement_media_service import (
@@ -1479,6 +1484,48 @@ def admin_refresh_order_payment(order_id: int, db: Session = Depends(get_db)):
             "expired_at": payment.expired_at.isoformat() if payment.expired_at else "",
         },
     }
+
+
+@router.post("/orders/{order_id}/simulate-paid")
+def admin_simulate_order_paid(order_id: int, request: Request, db: Session = Depends(get_db)):
+    profile = get_current_admin_profile(request)
+    if not bool(profile.get("is_superadmin")):
+        raise HTTPException(status_code=403, detail="仅 superadmin 可执行模拟支付成功")
+    if not simulate_payment_finalize_enabled():
+        raise HTTPException(status_code=403, detail="当前环境未开启模拟支付成功")
+
+    operator = str(profile.get("username") or get_current_admin_username(request) or "").strip() or "admin"
+
+    try:
+        order, payment = get_order_and_latest_payment_for_update(db, order_id)
+        result = simulate_payment_success(db, order, payment, operator=operator)
+        db.commit()
+        db.refresh(order)
+        db.refresh(payment)
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "ok": True,
+        "result": result,
+        "order": order_to_dict(order),
+        "payment": {
+            "pay_method": payment.pay_method,
+            "receive_address": payment.receive_address,
+            "expected_amount": str(payment.expected_amount),
+            "paid_amount": str(payment.paid_amount),
+            "txid": payment.txid,
+            "confirm_status": normalize_admin_payment_status(order, payment),
+            "confirm_status_text": admin_payment_status_text(normalize_admin_payment_status(order, payment)),
+            "paid_at": payment.paid_at.isoformat() if payment.paid_at else (order.paid_at.isoformat() if order.paid_at else ""),
+            "expired_at": payment.expired_at.isoformat() if payment.expired_at else "",
+        },
+    }
+
 
 @router.post("/orders/{order_id}/mark-paid")
 def admin_mark_paid(order_id: int, db: Session = Depends(get_db)):
