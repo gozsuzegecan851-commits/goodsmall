@@ -389,6 +389,51 @@ def _require_superadmin_request(request: Request, db: Session) -> AdminUser:
         raise HTTPException(status_code=403, detail=str(e))
 
 
+def _session_runtime_state_path() -> Path:
+    path = Path("/app/app/static/uploads/runtime/session_runtime.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_session_runtime_state() -> dict[str, Any]:
+    path = _session_runtime_state_path()
+    if not path.exists():
+        return {"bots": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {"bots": {}}
+    if not isinstance(data, dict):
+        return {"bots": {}}
+    bots = data.get("bots")
+    if not isinstance(bots, dict):
+        data["bots"] = {}
+    return data
+
+
+def _save_session_runtime_state(data: dict[str, Any]) -> None:
+    path = _session_runtime_state_path()
+    payload = data if isinstance(data, dict) else {"bots": {}}
+    if not isinstance(payload.get("bots"), dict):
+        payload["bots"] = {}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _resolve_session_runtime_bot_code(db: Session, bot_code: str = "") -> str:
+    code = str(bot_code or "").strip()
+    if code:
+        return code
+    rows = (
+        db.query(BotConfig)
+        .filter(BotConfig.bot_type == "session", BotConfig.is_enabled == True)  # noqa: E712
+        .order_by(BotConfig.id.asc())
+        .all()
+    )
+    if len(rows) == 1 and str(rows[0].bot_code or "").strip():
+        return str(rows[0].bot_code or "").strip()
+    raise HTTPException(status_code=400, detail="bot_code 不能为空，且当前不存在唯一启用的 session bot")
+
+
 def _alert_age_hours(value: datetime | None) -> int:
     if not value:
         return 0
@@ -2110,6 +2155,92 @@ def admin_supplier_payload_preview(order_id: int, db: Session = Depends(get_db))
 @router.get("/chat-overview")
 def admin_chat_overview(db: Session = Depends(get_db)):
     return get_chat_overview(db)
+
+
+@router.get("/chat-runtime/session-status")
+def admin_chat_runtime_session_status(request: Request, bot_code: str = "", db: Session = Depends(get_db)):
+    _require_admin_session(request, db)
+    code = _resolve_session_runtime_bot_code(db, bot_code)
+    state = _load_session_runtime_state()
+    bots = state.get("bots") or {}
+    row = bots.get(code) if isinstance(bots, dict) else None
+    row = row if isinstance(row, dict) else {}
+    subscribers = row.get("subscribers") if isinstance(row.get("subscribers"), list) else []
+    unread = list_sessions(db, bot_code=code, status="all", q="", only_unread=True, limit=10, page=1, page_size=10)
+    unread_count = int(unread.get("total") or 0) if isinstance(unread, dict) else 0
+    return {
+        "ok": True,
+        "bot_code": code,
+        "bot_username": str(row.get("bot_username") or "").strip(),
+        "subscribers": subscribers,
+        "subscriber_count": len(subscribers),
+        "unread_count": unread_count,
+        "last_push_at": str(row.get("last_push_at") or "").strip(),
+        "last_push_result": str(row.get("last_push_result") or "").strip(),
+        "pushed_count": int(row.get("pushed_count") or 0),
+        "failed_count": int(row.get("failed_count") or 0),
+    }
+
+
+@router.post("/chat-runtime/session-subscribe")
+def admin_chat_runtime_session_subscribe(
+    request: Request,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    require_internal_api(request)
+    bot_code = str((payload or {}).get("bot_code") or "").strip()
+    chat_id = str((payload or {}).get("chat_id") or "").strip()
+    subscribed = bool((payload or {}).get("subscribed"))
+    bot_username = str((payload or {}).get("bot_username") or "").strip()
+    if not bot_code:
+        raise HTTPException(status_code=400, detail="bot_code 不能为空")
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id 不能为空")
+    state = _load_session_runtime_state()
+    bots = state.setdefault("bots", {})
+    row = bots.setdefault(bot_code, {})
+    subscribers = row.get("subscribers")
+    if not isinstance(subscribers, list):
+        subscribers = []
+    normalized = [str(x).strip() for x in subscribers if str(x).strip()]
+    if subscribed:
+        if chat_id not in normalized:
+            normalized.append(chat_id)
+    else:
+        normalized = [x for x in normalized if x != chat_id]
+    row["subscribers"] = normalized
+    if bot_username:
+        row["bot_username"] = bot_username
+    row["updated_at"] = datetime.utcnow().isoformat()
+    _save_session_runtime_state(state)
+    return {"ok": True, "subscriber_count": len(normalized)}
+
+
+@router.post("/chat-runtime/session-report")
+def admin_chat_runtime_session_report(
+    request: Request,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    require_internal_api(request)
+    bot_code = str((payload or {}).get("bot_code") or "").strip()
+    if not bot_code:
+        raise HTTPException(status_code=400, detail="bot_code 不能为空")
+    state = _load_session_runtime_state()
+    bots = state.setdefault("bots", {})
+    row = bots.setdefault(bot_code, {})
+    row["subscriber_count"] = int((payload or {}).get("subscriber_count") or 0)
+    row["unread_count"] = int((payload or {}).get("unread_count") or 0)
+    row["pushed_count"] = int((payload or {}).get("pushed_count") or 0)
+    row["failed_count"] = int((payload or {}).get("failed_count") or 0)
+    row["last_push_result"] = str((payload or {}).get("last_push_result") or "").strip()
+    row["last_push_at"] = datetime.utcnow().isoformat()
+    row["updated_at"] = row["last_push_at"]
+    if not isinstance(row.get("subscribers"), list):
+        row["subscribers"] = []
+    _save_session_runtime_state(state)
+    return {"ok": True}
 
 
 @router.get("/chat-sessions")

@@ -38,7 +38,7 @@ def internal_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
 FOLDER_LINK_RUNTIME_CACHE: dict[str, Any] = {"expires_at": 0.0, "data": None}
 
 async def get_folder_link_runtime(bot_code: str, bot_type: str) -> dict:
-    now = time.time()
+    now = asyncio.get_running_loop().time()
     cached = FOLDER_LINK_RUNTIME_CACHE.get("data")
     if cached and float(FOLDER_LINK_RUNTIME_CACHE.get("expires_at") or 0) > now:
         return cached
@@ -241,9 +241,14 @@ async def notification_loop(bot_code: str):
         running = RUNNING_BOTS.get(bot_code)
         if not running or not running.subscribers:
             continue
+        pushed_count = 0
+        failed_count = 0
+        unread_count = 0
+        last_push_result = "idle"
         try:
             data = await api_get('/admin/chat-sessions', params={'status': 'all', 'only_unread': 'true', 'limit': 100, 'page': 1, 'page_size': 100})
             rows = _extract_session_rows(data)
+            unread_count = len(rows)
             current_keys: dict[int, tuple[int, str]] = {}
             for row in rows:
                 sid = int(row.get('id') or 0)
@@ -261,15 +266,30 @@ async def notification_loop(bot_code: str):
                 for chat_id in list(running.subscribers):
                     try:
                         await running.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+                        pushed_count += 1
                     except Exception as e:
+                        failed_count += 1
                         print(f"[session-runner] notify failed chat_id={chat_id}: {e}")
                         if 'chat not found' in str(e).lower() or 'forbidden' in str(e).lower():
                             stale.add(chat_id)
                 for chat_id in stale:
                     running.subscribers.discard(chat_id)
             running.last_seen = current_keys
+            last_push_result = f"ok pushed={pushed_count} failed={failed_count}"
         except Exception as e:
+            last_push_result = f"error: {e}"
             print(f"[session-runner] notification loop error for {bot_code}: {e}")
+        try:
+            await api_post('/admin/chat-runtime/session-report', {
+                'bot_code': bot_code,
+                'subscriber_count': len(running.subscribers),
+                'unread_count': unread_count,
+                'pushed_count': pushed_count,
+                'failed_count': failed_count,
+                'last_push_result': last_push_result,
+            })
+        except Exception as e:
+            print(f"[session-runner] session report failed for {bot_code}: {e}")
 
 
 def build_dispatcher(bot_code: str) -> Dispatcher:
@@ -312,6 +332,16 @@ def build_dispatcher(bot_code: str) -> Dispatcher:
         running = RUNNING_BOTS.get(bot_code)
         if running:
             running.subscribers.add(message.chat.id)
+        try:
+            me = await message.bot.get_me()
+            await api_post('/admin/chat-runtime/session-subscribe', {
+                'bot_code': bot_code,
+                'chat_id': message.chat.id,
+                'subscribed': True,
+                'bot_username': me.username or '',
+            })
+        except Exception as e:
+            print(f"[session-runner] subscribe report failed for {bot_code}: {e}")
         await message.answer(f"聚合聊天机器人已连接（{bot_code}）。\n已开启当前窗口的自动推送。\n\n{HELP}")
         await maybe_send_startup_announcement(message.bot, bot_code, RUNNER_TYPE, message.chat.id, message.from_user.id)
         await send_folder_link_prompt(message, bot_code, RUNNER_TYPE)
@@ -327,6 +357,14 @@ def build_dispatcher(bot_code: str) -> Dispatcher:
         running = RUNNING_BOTS.get(bot_code)
         if running:
             running.subscribers.discard(message.chat.id)
+        try:
+            await api_post('/admin/chat-runtime/session-subscribe', {
+                'bot_code': bot_code,
+                'chat_id': message.chat.id,
+                'subscribed': False,
+            })
+        except Exception as e:
+            print(f"[session-runner] unsubscribe report failed for {bot_code}: {e}")
         await message.answer('已关闭当前窗口的自动推送。再次发送 /start 可重新开启。')
 
     @dp.message(Command('unread'))
@@ -390,6 +428,12 @@ async def start_bot(bot_code: str, token: str):
         return
     bot = Bot(token=token, default=DefaultBotProperties())
     dp = build_dispatcher(bot_code)
+    try:
+        runtime = await api_get('/admin/chat-runtime/session-status', params={'bot_code': bot_code})
+        subscribers = runtime.get('subscribers') if isinstance(runtime, dict) else []
+    except Exception as e:
+        print(f"[session-runner] restore subscribers failed for {bot_code}: {e}")
+        subscribers = []
 
     async def runner_task():
         try:
@@ -411,7 +455,17 @@ async def start_bot(bot_code: str, token: str):
     task = asyncio.create_task(runner_task(), name=f'session:{bot_code}')
     hb = asyncio.create_task(heartbeat_loop(bot_code), name=f'session-hb:{bot_code}')
     notify = asyncio.create_task(notification_loop(bot_code), name=f'session-notify:{bot_code}')
-    RUNNING_BOTS[bot_code] = RunningBot(bot_code=bot_code, token=token, bot=bot, task=task, heartbeat_task=hb, notify_task=notify)
+    restored_subscribers: set[int] = set()
+    for raw_chat_id in subscribers or []:
+        text = str(raw_chat_id or "").strip()
+        if not text:
+            continue
+        try:
+            restored_subscribers.add(int(text))
+        except Exception:
+            continue
+    RUNNING_BOTS[bot_code] = RunningBot(bot_code=bot_code, token=token, bot=bot, task=task, heartbeat_task=hb, notify_task=notify, subscribers=restored_subscribers)
+    print(f"[session-runner] restored subscribers for {bot_code}: {len(restored_subscribers)}")
 
 
 async def stop_bot(bot_code: str):
