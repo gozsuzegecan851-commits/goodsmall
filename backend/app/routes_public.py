@@ -23,6 +23,7 @@ from .services.payment_usdt import (
     serialize_payment,
 )
 from .jobs.logistics_sync import sync_one_shipment
+from .services.logistics_trace_service import query_order_trace
 
 router = APIRouter()
 
@@ -428,3 +429,32 @@ def public_sync_order_logistics(order_id: int, telegram_user_id: str | None = No
     result = sync_one_shipment(db, shipment)
     db.commit()
     return result
+
+
+def _trace_value_error_http(e: ValueError) -> HTTPException:
+    msg = str(e)
+    if msg in ("订单不存在", "无权查看该订单"):
+        return HTTPException(status_code=404, detail="订单不存在")
+    safe_messages = {
+        "暂未发货，暂无物流单号",
+        "物流信息不完整，暂无法查询物流",
+        "物流查询暂不可用，请稍后再试",
+        "物流查询稍有延迟，请稍后重试",
+        "已录入快递单号，暂未查询到轨迹，请稍后再试",
+    }
+    detail = msg if msg in safe_messages else "物流查询失败，请稍后再试"
+    return HTTPException(status_code=400, detail=detail)
+
+
+@router.get("/orders/{order_id}/logistics-trace")
+def public_order_logistics_trace(order_id: int, telegram_user_id: str | None = None, db: Session = Depends(get_db)):
+    owner = _normalize_owner(telegram_user_id)
+    if not owner:
+        raise HTTPException(status_code=400, detail="telegram_user_id 不能为空")
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order or _normalize_owner(order.telegram_user_id) != owner:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    try:
+        return query_order_trace(db, order_id, customer_id=telegram_user_id)
+    except ValueError as e:
+        raise _trace_value_error_http(e) from None
