@@ -581,6 +581,7 @@ def render_admin_page(admin_username: str = "admin") -> str:
             <label class="space-top">卖家备注</label><textarea id="orderSellerRemark"></textarea>
             <div class="actions space-top">
               <button class="green" onclick="markOrderPaid()">标记已支付</button>
+              <button class="secondary" onclick="simulateOrderPaid()">模拟支付成功</button>
               <button class="orange" onclick="shipOrder()">录入发货</button>
               <button class="secondary" onclick="saveOrderRemark()">保存备注</button>
               <button class="secondary" onclick="syncOrderLogistics()">同步物流</button>
@@ -1650,6 +1651,38 @@ async function loadLogisticsApiOverview(){ try{ LOGISTICS_API_OVERVIEW = await a
   async function quickMarkPaid(id){ try{ await apiPost('/admin/orders/'+id+'/mark-paid', {}); await refreshOrders(); if(CURRENT_ORDER && CURRENT_ORDER.id===id) await loadOrderDetail(id); }catch(e){ setStatus('ordersStatus','标记支付失败：'+e.message); } }
   async function loadOrderDetail(id){ try{ CURRENT_ORDER = await apiGet('/admin/orders/'+id); $('orderDetailEmpty').style.display='none'; $('orderDetailBox').style.display='block'; $('orderDetailBasic').innerHTML = `<div><strong>订单号：</strong><span class="mono">${escapeHtml(CURRENT_ORDER.order_no)}</span></div><div><strong>买家：</strong>${escapeHtml(CURRENT_ORDER.customer_name)} / ${escapeHtml(CURRENT_ORDER.customer_phone)}</div><div><strong>地址：</strong>${escapeHtml([CURRENT_ORDER.province,CURRENT_ORDER.city,CURRENT_ORDER.district,CURRENT_ORDER.address_detail].filter(Boolean).join(' '))}</div><div><strong>状态：</strong>${payTag(CURRENT_ORDER.pay_status)} ${deliveryTag(CURRENT_ORDER.delivery_status)}</div><div><strong>当前供应链：</strong><span class="mono">${escapeHtml(CURRENT_ORDER.supplier_code || '-')}</span></div><div><strong>供应链推单：</strong>${CURRENT_ORDER.fulfillment && CURRENT_ORDER.fulfillment.sync_status==='synced' ? '<span class="tag ok">已回查</span>' : '<span class="tag warn">待推送/待回查</span>'}</div><div><strong>创建时间：</strong>${escapeHtml(formatTime(CURRENT_ORDER.created_at))}</div><div><strong>买家备注：</strong>${escapeHtml(CURRENT_ORDER.buyer_remark || '-')}</div>`; const pay = CURRENT_ORDER.payment; $('orderDetailPayment').innerHTML = pay ? `<div><strong>支付方式：</strong>${escapeHtml(pay.pay_method)}</div><div><strong>收款地址：</strong><span class="mono">${escapeHtml(pay.receive_address)}</span></div><div><strong>应付金额：</strong>${escapeHtml(pay.expected_amount)}</div><div><strong>支付状态：</strong>${escapeHtml(pay.confirm_status)}</div><div><strong>交易哈希：</strong><span class="mono">${escapeHtml(pay.txid || '-')}</span></div>` : '<div class="muted">暂无支付单信息</div>'; $('orderDetailItems').innerHTML = '<strong>商品明细</strong>' + (CURRENT_ORDER.items && CURRENT_ORDER.items.length ? `<table class="space-top"><thead><tr><th>商品</th><th>SKU</th><th>数量</th><th>单价</th><th>小计</th></tr></thead><tbody>${CURRENT_ORDER.items.map(i=>`<tr><td>${escapeHtml(i.product_name)}</td><td>${escapeHtml(i.sku_code || '')}</td><td>${escapeHtml(i.qty)}</td><td>${escapeHtml(i.unit_price)}</td><td>${escapeHtml(i.subtotal)}</td></tr>`).join('')}</tbody></table>` : '<div class="muted">暂无商品明细</div>'); $('shipCourierCompany').value = CURRENT_ORDER.courier_company || ''; $('shipCourierCode').value = CURRENT_ORDER.courier_code || ''; $('shipTrackingNo').value = CURRENT_ORDER.tracking_no || ''; $('orderSellerRemark').value = CURRENT_ORDER.seller_remark || ''; if($('orderAssignSupplier')){ $('orderAssignSupplier').innerHTML = '<option value="">请选择供应链</option>' + (CURRENT_ORDER.available_suppliers||[]).map(s=>`<option value="${s.id}" ${CURRENT_ORDER.fulfillment && CURRENT_ORDER.fulfillment.supplier_id===s.id?'selected':''}>${escapeHtml(s.supplier_code)} · ${escapeHtml(s.supplier_name)}</option>`).join(''); } if($('orderFulfillmentInfo')){ $('orderFulfillmentInfo').innerHTML = CURRENT_ORDER.fulfillment ? `当前履约：<strong>${escapeHtml(CURRENT_ORDER.fulfillment.supplier_code)} · ${escapeHtml(CURRENT_ORDER.fulfillment.supplier_name)}</strong><div class="muted">状态：${escapeHtml(CURRENT_ORDER.fulfillment.fulfillment_status || '-')}</div><div class="muted">分配时间：${escapeHtml(formatTime(CURRENT_ORDER.fulfillment.assigned_at))}</div><div class="muted">同步状态：${escapeHtml(CURRENT_ORDER.fulfillment.sync_status || '-')}</div><div class="muted">说明：${escapeHtml(CURRENT_ORDER.fulfillment.sync_error || '无')}</div><div class="muted">供应链单号：${escapeHtml(CURRENT_ORDER.fulfillment.supplier_order_no || '-')}</div>` : '<span class="muted">当前未分配供应链</span>'; } setStatus('orderDetailStatus','订单详情已加载。'); window.scrollTo({top:document.body.scrollHeight, behavior:'smooth'}); }catch(e){ setStatus('ordersStatus','加载详情失败：'+e.message); } }
   async function markOrderPaid(){ if(!CURRENT_ORDER) return; try{ await apiPost('/admin/orders/'+CURRENT_ORDER.id+'/mark-paid', {}); await refreshOrders(); await loadOrderDetail(CURRENT_ORDER.id); }catch(e){ setStatus('orderDetailStatus','标记已支付失败：'+e.message); } }
+  async function simulateOrderPaid(){
+    if(!CURRENT_ORDER) return;
+    const pay = CURRENT_ORDER.payment || null;
+    const orderStatus = String(CURRENT_ORDER.order_status || '').trim().toLowerCase();
+    const payStatus = String(CURRENT_ORDER.pay_status || '').trim().toLowerCase();
+    const confirmStatus = String((pay && pay.confirm_status) || '').trim().toLowerCase();
+    if(orderStatus === 'cancelled'){
+      setStatus('orderDetailStatus','已取消订单不允许模拟支付成功');
+      return;
+    }
+    if(payStatus === 'paid'){
+      setStatus('orderDetailStatus','订单已支付，无需模拟确认');
+      return;
+    }
+    if(!pay){
+      setStatus('orderDetailStatus','该订单暂无支付单');
+      return;
+    }
+    if(['confirmed','paid','success'].includes(confirmStatus)){
+      setStatus('orderDetailStatus','支付单已确认，无需模拟确认');
+      return;
+    }
+    if(!confirm('确定模拟该订单支付成功吗？此操作仅用于测试。')) return;
+    try{
+      await apiPost('/admin/orders/'+CURRENT_ORDER.id+'/simulate-paid', {});
+      await refreshOrders();
+      await loadOrderDetail(CURRENT_ORDER.id);
+      setStatus('orderDetailStatus','已模拟支付成功。');
+    }catch(e){
+      setStatus('orderDetailStatus','模拟支付成功失败：'+e.message);
+    }
+  }
   async function shipOrder(){ if(!CURRENT_ORDER) return; try{ const payload={courier_company:$('shipCourierCompany').value.trim(), courier_code:$('shipCourierCode').value.trim(), tracking_no:$('shipTrackingNo').value.trim()}; if(!payload.courier_company || !payload.tracking_no){ setStatus('orderDetailStatus','请先填写快递公司和快递单号。'); return; } await apiPost('/admin/orders/'+CURRENT_ORDER.id+'/ship', payload); await refreshOrders(); await loadOrderDetail(CURRENT_ORDER.id); setStatus('orderDetailStatus','已录入发货信息。'); }catch(e){ setStatus('orderDetailStatus','录入发货失败：'+e.message); } }
   async function saveOrderRemark(){ if(!CURRENT_ORDER) return; try{ await apiPost('/admin/orders/'+CURRENT_ORDER.id+'/remark', {seller_remark:$('orderSellerRemark').value.trim()}); await refreshOrders(); await loadOrderDetail(CURRENT_ORDER.id); setStatus('orderDetailStatus','备注已保存。'); }catch(e){ setStatus('orderDetailStatus','保存备注失败：'+e.message); } }
   async function completeOrder(){ if(!CURRENT_ORDER) return; try{ await apiPost('/admin/orders/'+CURRENT_ORDER.id+'/complete', {}); await refreshOrders(); await loadOrderDetail(CURRENT_ORDER.id); }catch(e){ setStatus('orderDetailStatus','标记完成失败：'+e.message); } }

@@ -91,9 +91,11 @@ def simulate_payment_success(
     *,
     operator: str,
 ) -> dict[str, Any]:
-    if str(order.pay_status or "").lower() == "paid":
+    if str(order.order_status or "").strip().lower() == "cancelled":
+        raise ValueError("已取消订单不允许模拟支付成功")
+    if str(order.pay_status or "").strip().lower() == "paid":
         raise ValueError("订单已支付，无需模拟确认")
-    if str(payment.confirm_status or "").lower() in {"confirmed", "paid", "success"}:
+    if str(payment.confirm_status or "").strip().lower() in {"confirmed", "paid", "success"}:
         raise ValueError("支付单已确认，无需模拟确认")
 
     to_address = str(payment.receive_address or "").strip()
