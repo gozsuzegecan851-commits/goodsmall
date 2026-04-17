@@ -15,7 +15,13 @@ from .models import (
     PaymentOrder,
 )
 from .services.order_service import create_order
-from .services.payment_usdt import create_payment_order, get_latest_payment_order, serialize_payment
+from .services.payment_usdt import (
+    PaymentAllocationConflictError,
+    PaymentAmountPoolExhaustedError,
+    create_payment_order,
+    get_latest_payment_order,
+    serialize_payment,
+)
 from .jobs.logistics_sync import sync_one_shipment
 
 router = APIRouter()
@@ -389,6 +395,10 @@ def public_create_usdt_payment(payload: schemas.PaymentCreateIn, db: Session = D
             "ok": True,
             **serialize_payment(payment, addr),
         }
+    except PaymentAmountPoolExhaustedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except PaymentAllocationConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -1,10 +1,32 @@
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import PaymentAddress, PaymentOrder, Order
+
+
+class PaymentAmountPoolExhaustedError(ValueError):
+    pass
+
+
+class PaymentAllocationConflictError(RuntimeError):
+    pass
+
+
+def _is_retryable_allocation_error(exc: Exception) -> bool:
+    raw = str(getattr(exc, "orig", exc) or "").lower()
+    return any(
+        token in raw
+        for token in (
+            "deadlock detected",
+            "lock timeout",
+            "could not obtain lock",
+            "serialization failure",
+        )
+    )
 
 
 def _normalize_qr_image(url: str) -> tuple[str, str]:
@@ -53,13 +75,15 @@ def _offset_candidates(base_amount: Decimal) -> list[tuple[Decimal, Decimal]]:
     return candidates
 
 
-def _pick_payment_address(db: Session) -> PaymentAddress | None:
-    return (
+def _pick_payment_address(db: Session, for_update: bool = False) -> PaymentAddress | None:
+    query = (
         db.query(PaymentAddress)
         .filter(PaymentAddress.is_active == True)
         .order_by(PaymentAddress.last_used_at.asc().nullsfirst(), PaymentAddress.sort_order.asc(), PaymentAddress.id.asc())
-        .first()
     )
+    if for_update:
+        query = query.with_for_update()
+    return query.first()
 
 
 def _pick_expected_amount(db: Session, address: PaymentAddress, order: Order) -> tuple[Decimal, Decimal]:
@@ -78,7 +102,7 @@ def _pick_expected_amount(db: Session, address: PaymentAddress, order: Order) ->
     for amount, offset in _offset_candidates(base_amount):
         if amount not in occupied:
             return amount, offset
-    raise ValueError('当前收款地址的待支付金额占位已满，请稍后重试或增加收款地址')
+    raise PaymentAmountPoolExhaustedError('当前收款地址的待支付金额占位已满，请稍后重试或增加收款地址')
 
 
 def serialize_payment(payment: PaymentOrder, address: PaymentAddress | None = None) -> dict:
@@ -112,44 +136,67 @@ def get_latest_payment_order(db: Session, order_id: int) -> PaymentOrder | None:
 
 
 def create_payment_order(db: Session, order_id: int) -> PaymentOrder:
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise ValueError("订单不存在")
-    if (order.order_status or '').strip() == 'cancelled':
-        raise ValueError('订单已关闭，不能再创建支付单')
-    if order.pay_status == "paid":
-        latest = get_latest_payment_order(db, order_id)
-        if latest:
-            return latest
-        raise ValueError("订单已支付")
+    for attempt in range(3):
+        try:
+            order = (
+                db.query(Order)
+                .filter(Order.id == order_id)
+                .with_for_update()
+                .first()
+            )
+            if not order:
+                raise ValueError("订单不存在")
+            if (order.order_status or '').strip() == 'cancelled':
+                raise ValueError('订单已关闭，不能再创建支付单')
+            if order.pay_status == "paid":
+                latest = get_latest_payment_order(db, order_id)
+                if latest:
+                    db.rollback()
+                    return latest
+                raise ValueError("订单已支付")
 
-    existing = (
-        db.query(PaymentOrder)
-        .filter(
-            PaymentOrder.order_id == order_id,
-            PaymentOrder.confirm_status == "pending",
-        )
-        .order_by(PaymentOrder.id.desc())
-        .first()
-    )
-    if existing and existing.expired_at and existing.expired_at > datetime.utcnow():
-        return existing
+            existing = (
+                db.query(PaymentOrder)
+                .filter(
+                    PaymentOrder.order_id == order_id,
+                    PaymentOrder.confirm_status == "pending",
+                )
+                .order_by(PaymentOrder.id.desc())
+                .first()
+            )
+            if existing and existing.expired_at and existing.expired_at > datetime.utcnow():
+                db.rollback()
+                return existing
 
-    address = _pick_payment_address(db)
-    if not address:
-        raise ValueError("没有可用收款地址")
+            address = _pick_payment_address(db, for_update=True)
+            if not address:
+                raise ValueError("没有可用收款地址")
 
-    expected_amount, amount_offset = _pick_expected_amount(db, address, order)
-    payment = PaymentOrder(
-        order_id=order.id,
-        receive_address=address.address,
-        expected_amount=expected_amount,
-        base_amount=_normalize_amount(order.payable_amount),
-        amount_offset=amount_offset,
-        expired_at=datetime.utcnow() + timedelta(minutes=settings.payment_expire_minutes),
-    )
-    address.last_used_at = datetime.utcnow()
-    db.add(payment)
-    db.commit()
-    db.refresh(payment)
-    return payment
+            expected_amount, amount_offset = _pick_expected_amount(db, address, order)
+            payment = PaymentOrder(
+                order_id=order.id,
+                receive_address=address.address,
+                expected_amount=expected_amount,
+                base_amount=_normalize_amount(order.payable_amount),
+                amount_offset=amount_offset,
+                expired_at=datetime.utcnow() + timedelta(minutes=settings.payment_expire_minutes),
+            )
+            address.last_used_at = datetime.utcnow()
+            db.add(payment)
+            db.flush()
+            db.commit()
+            db.refresh(payment)
+            return payment
+        except PaymentAmountPoolExhaustedError:
+            db.rollback()
+            raise
+        except ValueError:
+            db.rollback()
+            raise
+        except (OperationalError, DBAPIError) as e:
+            db.rollback()
+            if _is_retryable_allocation_error(e):
+                if attempt < 2:
+                    continue
+                raise PaymentAllocationConflictError("支付金额分配冲突，请稍后重试") from e
+            raise
