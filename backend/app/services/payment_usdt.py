@@ -75,12 +75,19 @@ def _offset_candidates(base_amount: Decimal) -> list[tuple[Decimal, Decimal]]:
     return candidates
 
 
-def _pick_payment_address(db: Session, for_update: bool = False) -> PaymentAddress | None:
+def _pick_payment_address(
+    db: Session,
+    *,
+    for_update: bool = False,
+    exclude_ids: set[int] | None = None,
+) -> PaymentAddress | None:
     query = (
         db.query(PaymentAddress)
         .filter(PaymentAddress.is_active == True)
         .order_by(PaymentAddress.last_used_at.asc().nullsfirst(), PaymentAddress.sort_order.asc(), PaymentAddress.id.asc())
     )
+    if exclude_ids:
+        query = query.filter(~PaymentAddress.id.in_(exclude_ids))
     if for_update:
         query = query.with_for_update()
     return query.first()
@@ -168,25 +175,41 @@ def create_payment_order(db: Session, order_id: int) -> PaymentOrder:
                 db.rollback()
                 return existing
 
-            address = _pick_payment_address(db, for_update=True)
-            if not address:
-                raise ValueError("没有可用收款地址")
+            tried_address_ids: set[int] = set()
+            while True:
+                address = _pick_payment_address(
+                    db,
+                    for_update=True,
+                    exclude_ids=tried_address_ids,
+                )
+                if not address:
+                    if tried_address_ids:
+                        raise PaymentAmountPoolExhaustedError(
+                            "当前所有可用收款地址的待支付金额占位已满，请稍后重试或增加收款地址"
+                        )
+                    raise ValueError("没有可用收款地址")
 
-            expected_amount, amount_offset = _pick_expected_amount(db, address, order)
-            payment = PaymentOrder(
-                order_id=order.id,
-                receive_address=address.address,
-                expected_amount=expected_amount,
-                base_amount=_normalize_amount(order.payable_amount),
-                amount_offset=amount_offset,
-                expired_at=datetime.utcnow() + timedelta(minutes=settings.payment_expire_minutes),
-            )
-            address.last_used_at = datetime.utcnow()
-            db.add(payment)
-            db.flush()
-            db.commit()
-            db.refresh(payment)
-            return payment
+                tried_address_ids.add(address.id)
+
+                try:
+                    expected_amount, amount_offset = _pick_expected_amount(db, address, order)
+                except PaymentAmountPoolExhaustedError:
+                    continue
+
+                payment = PaymentOrder(
+                    order_id=order.id,
+                    receive_address=address.address,
+                    expected_amount=expected_amount,
+                    base_amount=_normalize_amount(order.payable_amount),
+                    amount_offset=amount_offset,
+                    expired_at=datetime.utcnow() + timedelta(minutes=settings.payment_expire_minutes),
+                )
+                address.last_used_at = datetime.utcnow()
+                db.add(payment)
+                db.flush()
+                db.commit()
+                db.refresh(payment)
+                return payment
         except PaymentAmountPoolExhaustedError:
             db.rollback()
             raise
