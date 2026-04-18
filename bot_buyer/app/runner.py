@@ -80,6 +80,39 @@ MENU_CATALOG = "🛍 商品分类"
 MENU_ADDRESS = "📍 我的地址"
 MENU_ORDERS = "📦 我的订单"
 MENU_HELP = "💳 支付帮助"
+MENU_LOGISTICS = "📍 物流查询"
+
+
+def format_logistics_selfhelp_message(courier: str, tracking_no: str) -> str:
+    """自助查件说明（与订单详情内「物流查询」文案一致）。tracking_no 必须非空。"""
+    c = (courier or "").strip()
+    t = (tracking_no or "").strip()
+    if not t:
+        return ""
+    if c:
+        return (
+            f"快递公司：{c}\n"
+            f"快递单号：{t}\n\n"
+            "请复制快递单号，到快递官网、支付宝/微信「查快递」或常用查件工具中自行查询。\n"
+            "如物流信息刚录入，可能会有短暂延迟。"
+        )
+    return (
+        f"快递单号：{t}\n\n"
+        "请复制快递单号，到常用查件工具中自行查询。\n"
+        "如需人工协助，请联系客服。"
+    )
+
+
+def rows_shipped_with_tracking(rows: list | None) -> list:
+    """已发货且列表侧已有快递单号的订单（来自 GET /orders）。"""
+    out = []
+    for r in rows or []:
+        if str(r.get("delivery_status") or "") not in ("shipped", "signed"):
+            continue
+        if str(r.get("tracking_no") or "").strip():
+            out.append(r)
+    return out
+
 
 class AddressForm(StatesGroup):
     waiting_template = State()
@@ -324,6 +357,7 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=MENU_CATALOG), KeyboardButton(text=MENU_ADDRESS)],
             [KeyboardButton(text=MENU_ORDERS), KeyboardButton(text=MENU_HELP)],
+            [KeyboardButton(text=MENU_LOGISTICS)],
         ],
         resize_keyboard=True,
     )
@@ -874,6 +908,43 @@ def build_dispatcher(bot_code: str) -> Dispatcher:
         await message.answer("支付说明：\n1. 下单后会生成 USDT-TRC20 支付页。\n2. 支付后点击“刷新支付状态”。\n3. 自动确认完成后，订单会进入待发货。", reply_markup=main_menu())
         await send_folder_link_prompt(message, bot_code, RUNNER_TYPE)
 
+    @dp.message(F.text == MENU_LOGISTICS)
+    async def menu_logistics_overview(message: Message):
+        uid = message.from_user.id
+        try:
+            rows = await api_get("/orders", params={"telegram_user_id": str(uid)})
+        except Exception:
+            await message.answer("加载物流信息失败，请稍后再试")
+            return
+        shipped = rows_shipped_with_tracking(rows)
+        if not shipped:
+            await message.answer("暂无已发货订单。")
+            return
+        if len(shipped) == 1:
+            oid = int(shipped[0]["id"])
+            try:
+                order = await api_get(f"/orders/{oid}", params={"telegram_user_id": str(uid)})
+            except Exception:
+                await message.answer("加载物流信息失败，请稍后再试")
+                return
+            shipment = order.get("shipment") or {}
+            courier = str(shipment.get("courier_company") or order.get("courier_company") or "").strip()
+            track = str(shipment.get("tracking_no") or order.get("tracking_no") or "").strip()
+            if not track:
+                await message.answer("暂无已发货订单。")
+                return
+            text = format_logistics_selfhelp_message(courier, track)
+            await message.answer(text)
+            return
+        btns = [
+            [InlineKeyboardButton(text=f"📦 {r['order_no']}", callback_data=f"otrace:{r['id']}")]
+            for r in shipped[:20]
+        ]
+        await message.answer(
+            "你有多笔已发货订单，请选择要查询物流的订单：",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=btns),
+        )
+
     @dp.callback_query(F.data == 'folder_hint')
     async def cb_folder_hint(callback: CallbackQuery):
         runtime = await get_folder_link_runtime(bot_code, RUNNER_TYPE)
@@ -1064,20 +1135,7 @@ def build_dispatcher(bot_code: str) -> Dispatcher:
             await callback.answer("暂未发货，暂无物流单号。", show_alert=True)
             return
 
-        if courier:
-            text = (
-                f"快递公司：{courier}\n"
-                f"快递单号：{track}\n\n"
-                "请复制快递单号，到快递官网、支付宝/微信「查快递」或常用查件工具中自行查询。\n"
-                "如物流信息刚录入，可能会有短暂延迟。"
-            )
-        else:
-            text = (
-                f"快递单号：{track}\n\n"
-                "请复制快递单号，到常用查件工具中自行查询。\n"
-                "如需人工协助，请联系客服。"
-            )
-
+        text = format_logistics_selfhelp_message(courier, track)
         await callback.message.answer(text)
         await callback.answer()
 
