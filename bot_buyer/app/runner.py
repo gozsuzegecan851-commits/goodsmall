@@ -81,11 +81,6 @@ MENU_ADDRESS = "📍 我的地址"
 MENU_ORDERS = "📦 我的订单"
 MENU_HELP = "💳 支付帮助"
 
-MSG_LOG_NO_TRACK = "暂未发货，暂无物流单号"
-MSG_LOG_NO_TRACE = "已录入快递单号，暂未查询到轨迹，请稍后再试"
-MSG_LOG_DELAY = "物流查询稍有延迟，请稍后重试"
-MSG_LOG_FAIL = "物流查询失败，请稍后再试"
-
 class AddressForm(StatesGroup):
     waiting_template = State()
 
@@ -507,7 +502,7 @@ def order_actions_kb(order_id: int, pending_pay: bool, show_logistics: bool = Fa
     else:
         rows.append([InlineKeyboardButton(text="✅ 已确认支付", callback_data=f"paidhint:{order_id}")])
     if show_logistics:
-        rows.append([InlineKeyboardButton(text="📍 查询物流", callback_data=f"otrace:{order_id}")])
+        rows.append([InlineKeyboardButton(text="📍 物流查询", callback_data=f"otrace:{order_id}")])
     rows.append([InlineKeyboardButton(text="📦 返回我的订单", callback_data="orders:list")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1053,73 +1048,37 @@ def build_dispatcher(bot_code: str) -> Dispatcher:
     async def cb_order_logistics_trace(callback: CallbackQuery):
         order_id = int(callback.data.split(":", 1)[1])
         try:
-            data = await api_get(
-                f"/orders/{order_id}/logistics-trace",
+            order = await api_get(
+                f"/orders/{order_id}",
                 params={"telegram_user_id": str(callback.from_user.id)},
             )
-        except RuntimeError as e:
-            err = str(e).strip()
-            if MSG_LOG_NO_TRACK in err or "暂无物流单号" in err:
-                hint = MSG_LOG_NO_TRACK
-            elif MSG_LOG_DELAY in err or "稍有延迟" in err:
-                hint = MSG_LOG_DELAY
-            elif "暂未查询到轨迹" in err:
-                hint = MSG_LOG_NO_TRACE
-            elif "物流信息不完整" in err or "暂无法查询" in err:
-                hint = err[:180]
-            elif "物流查询暂不可用" in err:
-                hint = "物流查询暂不可用，请稍后再试"
-            else:
-                hint = err[:180] if len(err) <= 180 else MSG_LOG_FAIL
-            await callback.answer(hint, show_alert=True)
-            return
         except Exception:
-            await callback.answer(MSG_LOG_FAIL, show_alert=True)
+            await callback.answer("加载物流信息失败，请稍后再试", show_alert=True)
             return
 
-        courier = str(data.get("courier_name") or data.get("courier_company") or "-")
-        track = str(data.get("tracking_no") or "-")
-        status = str(data.get("status_text") or data.get("status_code") or "-")
-        latest = data.get("latest_trace") if isinstance(data.get("latest_trace"), dict) else {}
-        recent = data.get("recent_traces") if isinstance(data.get("recent_traces"), list) else []
+        shipment = order.get("shipment") or {}
+        courier = str(shipment.get("courier_company") or order.get("courier_company") or "").strip()
+        track = str(shipment.get("tracking_no") or order.get("tracking_no") or "").strip()
 
-        has_latest = bool((latest or {}).get("context") or (latest or {}).get("time"))
-        has_recent = any(
-            isinstance(tr, dict) and (tr.get("context") or tr.get("time")) for tr in recent[:3]
-        )
+        if not track:
+            await callback.answer("暂未发货，暂无物流单号。", show_alert=True)
+            return
 
-        lines = [
-            f"<b>物流公司：</b>{escape(courier)}",
-            f"<b>快递单号：</b><code>{escape(track)}</code>",
-            f"<b>当前状态：</b>{escape(status)}",
-        ]
-        if not has_latest and not has_recent:
-            lines.append(f"<b>最新轨迹：</b>{escape(MSG_LOG_NO_TRACE)}")
-            lines.append(f"<b>最近 3 条轨迹：</b>{escape(MSG_LOG_NO_TRACE)}")
+        if courier:
+            text = (
+                f"快递公司：{courier}\n"
+                f"快递单号：{track}\n\n"
+                "请复制快递单号，到快递官网、支付宝/微信「查快递」或常用查件工具中自行查询。\n"
+                "如物流信息刚录入，可能会有短暂延迟。"
+            )
         else:
-            if has_latest:
-                lines.append(
-                    f"<b>最新轨迹：</b>{escape(str((latest or {}).get('time') or ''))} "
-                    f"{escape(str((latest or {}).get('context') or ''))}"
-                )
-            else:
-                lines.append(f"<b>最新轨迹：</b>{escape(MSG_LOG_NO_TRACE)}")
-            lines.append("<b>最近 3 条轨迹：</b>")
-            shown = 0
-            for tr in recent[:3]:
-                if not isinstance(tr, dict):
-                    continue
-                t = str(tr.get("time") or "").strip()
-                c = str(tr.get("context") or "").strip()
-                if not t and not c:
-                    continue
-                lines.append(f"- {escape(t)} {escape(c)}")
-                shown += 1
-            if not shown:
-                lines.append(escape(MSG_LOG_NO_TRACE))
+            text = (
+                f"快递单号：{track}\n\n"
+                "请复制快递单号，到常用查件工具中自行查询。\n"
+                "如需人工协助，请联系客服。"
+            )
 
-        text = "\n".join(lines)
-        await callback.message.answer(text, parse_mode=ParseMode.HTML)
+        await callback.message.answer(text)
         await callback.answer()
 
     @dp.callback_query(F.data.startswith("pay:"))
