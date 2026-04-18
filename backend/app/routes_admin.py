@@ -69,7 +69,7 @@ from .folder_link_service import (
     validate_folder_link_url,
 )
 from .folder_link_check_service import check_folder_link_status, should_recheck
-from .jobs.logistics_sync import sync_one_shipment
+from .jobs.logistics_sync import subscribe_pending_shipments_kdzs, sync_one_shipment, try_kdzs_subscribe_shipment
 from .services.order_service import (
     resolve_order_supplier,
     upsert_order_fulfillment,
@@ -1482,6 +1482,8 @@ def admin_order_detail(order_id: int, db: Session = Depends(get_db)):
             "ship_status": shipment.ship_status,
             "last_trace_text": shipment.last_trace_text,
             "last_trace_time": shipment.last_trace_time.isoformat() if shipment.last_trace_time else "",
+            "last_sync_at": shipment.last_sync_at.isoformat() if getattr(shipment, "last_sync_at", None) else "",
+            "subscribe_status": getattr(shipment, "subscribe_status", "") or "",
         } if shipment else None,
         "traces": [{
             "trace_time": t.trace_time.isoformat() if t.trace_time else "",
@@ -1609,7 +1611,14 @@ def admin_ship_order(order_id: int, payload: schemas.OrderShipIn, db: Session = 
     shipment.sync_error = ''
     shipment.last_sync_at = None
     db.commit()
-    return {"ok": True}
+    ship_saved = db.query(Shipment).filter(Shipment.order_id == item.id).order_by(Shipment.id.desc()).first()
+    resp: dict = {"ok": True}
+    if ship_saved:
+        sub = try_kdzs_subscribe_shipment(db, ship_saved)
+        db.commit()
+        resp["subscribe_ok"] = bool(sub.get("ok"))
+        resp["subscribe_message"] = str(sub.get("message") or "").strip()
+    return resp
 
 @router.post("/orders/{order_id}/complete")
 def admin_complete_order(order_id: int, db: Session = Depends(get_db)):
@@ -1804,7 +1813,16 @@ def admin_supplier_template_sample(supplier_id: int, mode: str = "pending", db: 
 async def admin_import_shipments(file: UploadFile = File(...), supplier_code: str = Form(""), db: Session = Depends(get_db)):
     content = await file.read()
     batch = import_shipments(db, content, file.filename or "shipment_import.xlsx", operator_name="admin", supplier_code=supplier_code)
-    return {"ok": True, "batch_id": batch.id, "batch_no": batch.batch_no}
+    sub = subscribe_pending_shipments_kdzs(db)
+    db.commit()
+    return {
+        "ok": True,
+        "batch_id": batch.id,
+        "batch_no": batch.batch_no,
+        "subscribe_ok": bool(sub.get("ok")),
+        "subscribe_count": int(sub.get("count") or 0),
+        "subscribe_message": str(sub.get("message") or "").strip(),
+    }
 
 @router.get("/shipments/import-batches")
 def admin_import_batches(db: Session = Depends(get_db)):
